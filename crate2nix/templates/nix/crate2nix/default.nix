@@ -153,8 +153,20 @@ rec {
         # their log and the test executables to $out for later inspection.
         test =
           let
-            drv = testCrate.override (_: {
+            drv = testCrate.override (old: {
               buildTests = true;
+              # Set CARGO_BIN_EXE_* environment variables for integration tests.
+              # These are normally set by cargo, but crate2nix needs to set them
+              # manually. By referencing ${crate}, nix ensures the main crate is
+              # built first.
+              preBuild = (old.preBuild or "") + ''
+                for bin in ${crate}/bin/*; do
+                  if [[ -x "$bin" ]]; then
+                    name=$(basename "$bin")
+                    export "CARGO_BIN_EXE_$name=$bin"
+                  fi
+                done
+              '';
             });
             # If the user hasn't set any pre/post commands, we don't want to
             # insert empty lines. This means that any existing users of crate2nix

@@ -132,6 +132,11 @@ rec {
 
     testCrateFlags: list of flags to pass to the test exectuable
     testInputs: list of packages that should be available during test execution
+    runDocTests: if true, run doc tests via rustdoc --test
+    directDepsDrvs: list of direct dependency derivations with externName/fileLibName (for --extern flags in doc tests)
+    transitiveDeps: list of all transitive dependency derivations (for -L paths in doc tests)
+    crateConfig: crate configuration (needed for edition info in doc tests)
+    docTestBuildInputs: native library dependencies collected from crate overrides (for doc test linking)
   */
   crateWithTest =
     { crate
@@ -140,12 +145,21 @@ rec {
     , testInputs
     , testPreRun
     , testPostRun
-    ,
+    , runDocTests ? false
+    , directDepsDrvs ? []
+    , transitiveDeps ? []
+    , crateConfig ? {}
+    , docTestBuildInputs ? []
     }:
       assert builtins.typeOf testCrateFlags == "list";
       assert builtins.typeOf testInputs == "list";
       assert builtins.typeOf testPreRun == "string";
       assert builtins.typeOf testPostRun == "string";
+      assert builtins.typeOf runDocTests == "bool";
+      assert builtins.typeOf directDepsDrvs == "list";
+      assert builtins.typeOf transitiveDeps == "list";
+      assert builtins.typeOf crateConfig == "set";
+      assert builtins.typeOf docTestBuildInputs == "list";
       let
         # override the `crate` so that it will build and execute tests instead of
         # building the actual lib and bin targets We just have to pass `--test`
@@ -178,15 +192,100 @@ rec {
                 testPostRun
               ]
             );
+
+            # For doc tests: get the library name from config (libName overrides crateName)
+            normalizeCrateName = name: lib.replaceStrings ["-"] ["_"] name;
+            crateName = crateConfig.libName or (normalizeCrateName (crateConfig.crateName or crate.crateName or "unknown"));
+            edition = crateConfig.edition or "2021";
+
+            # Skip doc tests for proc-macro crates (they can't be tested via rustdoc)
+            isProcMacro = crateConfig.procMacro or false;
+
+            # Doc test command: runs rustdoc --test on lib.rs if it exists
+            docTestCommand = lib.optionalString (runDocTests && !isProcMacro) ''
+              # Run doc tests if lib.rs exists and the crate has a library
+              if [[ -f src/lib.rs ]] && [[ -d ${crate.lib}/lib ]]; then
+                echo "Running doc tests for ${crateName}..." | tee -a $out
+
+                # Set Cargo environment variables that macros like env!() expect
+                # See: https://doc.rust-lang.org/cargo/reference/environment-variables.html
+                export CARGO_PKG_NAME="${crateConfig.crateName or ""}"
+                export CARGO_PKG_VERSION="${crateConfig.version or "0.0.0"}"
+                export CARGO_PKG_VERSION_MAJOR="${lib.versions.major (crateConfig.version or "0")}"
+                export CARGO_PKG_VERSION_MINOR="${lib.versions.minor (crateConfig.version or "0")}"
+                export CARGO_PKG_VERSION_PATCH="${lib.versions.patch (crateConfig.version or "0")}"
+                export CARGO_PKG_AUTHORS="${lib.concatStringsSep ":" (crateConfig.authors or [])}"
+                export CARGO_CRATE_NAME="${crateName}"
+                export CARGO_MANIFEST_DIR="$PWD"
+
+                # Set OUT_DIR to where buildRustCrate puts build script outputs
+                # This allows env!("OUT_DIR") and include!(concat!(env!("OUT_DIR"), ...)) to work
+                export OUT_DIR="${crate.lib}/lib/${crateConfig.crateName or crateName}.out"
+
+                # Build --extern flags from DIRECT dependencies only (not transitive)
+                # This matches how Cargo runs rustdoc - transitive deps are already
+                # compiled into the direct deps' rlibs
+                externArgs=""
+                for dep in ${lib.concatMapStringsSep " " (dep:
+                  if dep.drv ? lib && dep.externName != "" then
+                    # Format: libPath:externName:fileLibName
+                    "${dep.drv.lib}:${dep.externName}:${dep.fileLibName}"
+                  else ""
+                ) directDepsDrvs}; do
+                  if [[ -n "$dep" ]]; then
+                    libPath="''${dep%%:*}"
+                    rest="''${dep#*:}"
+                    externName="''${rest%%:*}"
+                    fileLibName="''${rest##*:}"
+                    # Check for regular crate (.rlib) or proc-macro (.so/.dylib/.dll)
+                    # Use set +f to ensure glob expansion works (Nix may have noglob set)
+                    libfile=$(set +f; shopt -s nullglob; files=("$libPath/lib/lib$fileLibName"-*.rlib "$libPath/lib/lib$fileLibName"-*.so "$libPath/lib/lib$fileLibName"-*.dylib "$libPath/lib/lib$fileLibName"-*.dll); echo "''${files[0]}")
+                    if [[ -f "$libfile" ]]; then
+                      externArgs="$externArgs --extern $externName=$libfile"
+                    else
+                      echo "  WARNING: No library found for $fileLibName in $libPath/lib/" | tee -a $out
+                    fi
+                  fi
+                done
+
+                # Add the crate's own library
+                selfLib=$(set +f; shopt -s nullglob; files=("${crate.lib}/lib/lib${crateName}"-*.rlib); echo "''${files[0]}")
+                if [[ -f "$selfLib" ]]; then
+                  externArgs="$externArgs --extern ${crateName}=$selfLib"
+                fi
+
+                # Collect library paths from all transitive dependencies
+                libPathArgs="-L ${crate.lib}/lib"
+                for dep in ${lib.concatMapStringsSep " " (dep:
+                  if dep.drv ? lib then "${dep.drv.lib}/lib" else ""
+                ) transitiveDeps}; do
+                  if [[ -n "$dep" ]]; then
+                    libPathArgs="$libPathArgs -L $dep"
+                  fi
+                done
+
+                rustdoc --test src/lib.rs \
+                  --crate-name ${crateName} \
+                  --edition ${edition} \
+                  $libPathArgs \
+                  $externArgs \
+                  2>&1 | tee -a $out
+                echo "Doc tests passed for ${crateName}" | tee -a $out
+              fi
+            '';
+            # Use stdenv (not stdenvNoCC) when doc tests are enabled, since rustdoc
+            # needs to compile test code which requires a linker
+            mkDerivation = if runDocTests then pkgs.stdenv.mkDerivation else pkgs.stdenvNoCC.mkDerivation;
           in
-          pkgs.stdenvNoCC.mkDerivation {
+          mkDerivation {
             name = "run-tests-${testCrate.name}";
 
             inherit (crate) src;
 
             inherit testCrateFlags;
 
-            buildInputs = testInputs;
+            # Doc tests need rustc and any native library dependencies from crate overrides
+            buildInputs = testInputs ++ lib.optionals runDocTests ([ pkgs.rustc ] ++ docTestBuildInputs);
 
             buildPhase = ''
               set -e
@@ -212,6 +311,8 @@ rec {
                 cp $file $f
                 ${testCommand}
               done
+
+              ${docTestCommand}
             '';
           };
       in
@@ -238,6 +339,7 @@ rec {
     , crateOverrides ? defaultCrateOverrides
     , buildRustCrateForPkgsFunc ? null
     , runTests ? false
+    , runDocTests ? false
     , testCrateFlags ? [ ]
     , testInputs ? [ ]
     , # Any command to run immediatelly before a test is executed.
@@ -251,6 +353,7 @@ rec {
         { features
         , crateOverrides
         , runTests
+        , runDocTests
         , testCrateFlags
         , testInputs
         , testPreRun
@@ -283,13 +386,79 @@ rec {
           };
           drv = builtRustCrates.crates.${packageId};
           testDrv = builtTestRustCrates.crates.${packageId};
+
+          # For doc tests, we need to resolve all packages in the dependency tree.
+          # mergedFeatures gives us the packageIds, which we'll use to build both
+          # direct deps (for --extern flags) and transitive deps (for -L paths).
+          crateConfig = crates.${packageId};
+          mergedFeatures = mergePackageFeatures {
+            inherit packageId;
+            features = features;
+            target = makeDefaultTarget stdenv.hostPlatform;
+          };
+
+          # For doc tests, we only need DIRECT dependencies of the root crate,
+          # not all transitive deps. Transitive deps are already compiled into
+          # the direct deps' rlibs. This matches how Cargo runs rustdoc.
+          directDeps = filterEnabledDependencies {
+            dependencies = crateConfig.dependencies or [];
+            features = mergedFeatures.${packageId} or [];
+            target = makeDefaultTarget stdenv.hostPlatform;
+          };
+          directDepsDrvs = lib.filter (c: c.drv != null) (
+            map (dep:
+              let
+                pkgId = dep.packageId;
+                drv = builtRustCrates.crates.${pkgId} or null;
+                config = crates.${pkgId} or {};
+                # externName: the name used in code (--extern NAME=path) - use rename if specified
+                externName = dep.rename or config.libName or (lib.replaceStrings ["-"] ["_"] (config.crateName or ""));
+                # fileLibName: the actual library filename - always based on the crate's libName/crateName
+                fileLibName = config.libName or (lib.replaceStrings ["-"] ["_"] (config.crateName or ""));
+              in
+              { inherit drv externName fileLibName; }
+            ) directDeps
+          );
+
+          # Also keep the full transitive deps list for -L paths (library search paths)
+          transitiveDeps = lib.filter (c: c.drv != null) (
+            map (pkgId:
+              let
+                drv = builtRustCrates.crates.${pkgId} or null;
+                config = crates.${pkgId} or {};
+                libName = config.libName or (lib.replaceStrings ["-"] ["_"] (config.crateName or ""));
+              in
+              { inherit drv libName; }
+            ) (builtins.attrNames mergedFeatures)
+          );
+
+          # Collect native library buildInputs from crate overrides for all
+          # packages in the dependency tree. These are needed for doc test linking.
+          docTestBuildInputs = lib.unique (lib.flatten (
+            map (pkgId:
+              let
+                config = crates.${pkgId} or {};
+                crateName = config.crateName or "";
+                override = crateOverrides.${crateName} or (attrs: {});
+                # Apply override with crate config to extract buildInputs
+                overrideResult = override config;
+              in
+              overrideResult.buildInputs or []
+            ) (builtins.attrNames mergedFeatures)
+          ));
+
           derivation =
-            if runTests then
+            if runTests || runDocTests then
               crateWithTest
                 {
                   crate = drv;
                   testCrate = testDrv;
                   inherit
+                    runDocTests
+                    directDepsDrvs
+                    transitiveDeps
+                    crateConfig
+                    docTestBuildInputs
                     testCrateFlags
                     testInputs
                     testPreRun
@@ -306,6 +475,7 @@ rec {
           features
           crateOverrides
           runTests
+          runDocTests
           testCrateFlags
           testInputs
           testPreRun
